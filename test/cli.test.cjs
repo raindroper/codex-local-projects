@@ -40,7 +40,7 @@ test('many projects and assignments import without relying on machine or account
   assert.deepEqual(output[ATOMS].cloudSentinel, input[ATOMS].cloudSentinel);
 });
 
-test('CLI creates a pre-change backup, writes verified state, and refuses an unguarded apply', t => {
+test('CLI preserves a UTF-8 BOM backup, writes verified state, and refuses an unguarded apply', t => {
   const tempRoot = path.resolve(os.tmpdir());
   const directory = fs.mkdtempSync(path.join(tempRoot, 'codex-local-projects-test-'));
   t.after(() => {
@@ -51,7 +51,7 @@ test('CLI creates a pre-change backup, writes verified state, and refuses an ung
   });
   const statePath = path.join(directory, 'state.json'), runDir = path.join(directory, 'run');
   const original = fixture(directory);
-  const originalText = JSON.stringify(original);
+  const originalText = '\uFEFF' + JSON.stringify(original);
   fs.writeFileSync(statePath, originalText);
   function run(command, closed = false) {
     const env = { ...process.env };

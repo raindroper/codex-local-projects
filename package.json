@@ -1,13 +1,15 @@
 {
   "name": "codex-local-projects",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Restore missing local Codex projects and conversation assignments after switching accounts on Windows.",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test test/*.test.cjs",
-    "check": "node --check codex-local-projects.cjs"
+    "test": "node --test",
+    "check": "node --check codex-local-projects.cjs",
+    "test:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File test/launcher.integration.ps1",
+    "package:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Build-Release.ps1"
   }
 }

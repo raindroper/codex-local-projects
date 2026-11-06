@@ -4,9 +4,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const crypto = require('node:crypto');
 const assert = require('node:assert/strict');
 const { isDeepStrictEqual } = require('node:util');
+const { digest, parseJson, writeAtomic, commitState } = require('./state-store.cjs');
 
 const ACCOUNT = 'electron-account-renderer-state-v1';
 const ATOMS = 'electron-persisted-atom-state';
@@ -16,8 +16,13 @@ const clone = value => structuredClone(value);
 const unique = values => [...new Set(values)];
 const mapObject = value => value && typeof value === 'object' && !Array.isArray(value);
 const pairs = value => Object.entries(mapObject(value) ? value : {});
-const readJson = file => JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
-const digest = text => crypto.createHash('sha256').update(text).digest('hex');
+const readJson = file => parseJson(fs.readFileSync(file));
+const canonical = value => Array.isArray(value) ? value.map(canonical) : mapObject(value)
+  ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+function planFingerprint(plan) {
+  const { summary, statePath, fingerprint, ...payload } = plan;
+  return digest(JSON.stringify(canonical(payload)));
+}
 
 function validate(state) {
   assert(mapObject(state) && mapObject(state[ACCOUNT]), 'Unsupported account-state format; no changes made.');
@@ -25,10 +30,18 @@ function validate(state) {
   assert(account.owner === null || typeof account.owner === 'string', 'Unsupported account owner.');
   assert(mapObject(account.inactive), 'Unsupported inactive account format.');
   for (const [, scope] of pairs(account.inactive)) {
-    assert(mapObject(scope.globals) && mapObject(scope.atoms), 'Unsupported saved account format.');
+    assert(mapObject(scope) && mapObject(scope.globals) && mapObject(scope.atoms), 'Unsupported saved account format.');
   }
+  assert(state[ATOMS] == null || mapObject(state[ATOMS]), 'Unsupported active UI state format.');
   for (const globals of [state, ...Object.values(account.inactive).map(scope => scope.globals)]) {
     for (const key of ['local-projects', 'thread-project-assignments']) {
+      assert(globals[key] == null || mapObject(globals[key]), `Unsupported ${key} format.`);
+    }
+    for (const [, project] of pairs(globals['local-projects'])) assert(mapObject(project), 'Unsupported local project record.');
+    for (const key of ['project-order', 'projectless-thread-ids', 'electron-saved-workspace-roots']) {
+      assert(globals[key] == null || (Array.isArray(globals[key]) && globals[key].every(value => typeof value === 'string')), `Unsupported ${key} format.`);
+    }
+    for (const key of [MAPPING, MIGRATION, 'thread-project-membership-host-ids']) {
       assert(globals[key] == null || mapObject(globals[key]), `Unsupported ${key} format.`);
     }
   }
@@ -51,9 +64,9 @@ function isPureLocal(id, project) {
   return !pairs(project).some(([key, value]) => value != null && /^(chatGpt|retiredChatGpt|remote|cloud)/i.test(key));
 }
 
-function buildPlan(state) {
+function buildPlan(state, options = {}) {
   validate(state);
-  const owner = state[ACCOUNT].owner;
+  const owner = options.targetOwner || state[ACCOUNT].owner;
   assert(typeof owner === 'string' && owner.length, 'Open Codex and sign in to the destination account first.');
   const target = getTarget(state, owner);
   const scopes = [{ globals: state, atoms: state[ATOMS] || {} }, ...Object.values(state[ACCOUNT].inactive)];
@@ -121,19 +134,27 @@ function buildPlan(state) {
     if (typeof value === 'boolean') atoms[key] = value;
   }
   const projectOrder = unique([...ordering, ...newIds]);
-  return { schemaVersion: 1, targetOwner: owner, projects, assignments, globals, atoms,
+  const plan = { schemaVersion: 2, targetOwner: owner, projects, assignments, globals, atoms,
     roots, mappings, projectOrder, summary: {
       currentProjects: pairs(target.globals['local-projects']).length,
       addProjects: newIds.size, addAssignments: Object.keys(assignments).length,
       conflictingAssignments, excludedLinkedProjects,
-      missingFolders: roots.filter(root => !fs.existsSync(root)),
+      recoverableProjects: providers.size,
+      outcome: providers.size === 0 ? 'no_local_source' : conflictingAssignments > 0 ? 'conflicts'
+        : newIds.size > 0 || Object.keys(assignments).length > 0 ? 'ready' : 'already_complete',
       needsRestart: newIds.size > 0 || Object.keys(assignments).length > 0
     } };
+  plan.fingerprint = planFingerprint(plan);
+  return plan;
 }
 
 function applyPlan(input, plan, statePath) {
-  assert.equal(plan.schemaVersion, 1, 'Unsupported plan format.');
+  assert.equal(plan.schemaVersion, 2, 'Unsupported plan format. Run the current tool again.');
+  assert.equal(plan.fingerprint, planFingerprint(plan), 'The plan was modified. Run the tool again.');
   const state = clone(input), target = getTarget(state, plan.targetOwner);
+  const freshPlan = buildPlan(input, { targetOwner: plan.targetOwner });
+  if (verify(input, plan).recordsMatch) return state;
+  assert.equal(freshPlan.fingerprint, plan.fingerprint, 'Local project metadata changed after planning. Nothing was written; run the tool again.');
   if (!plan.summary.needsRestart) return state;
   if (target.active && !state[ATOMS]) state[ATOMS] = target.atoms;
   const globals = target.globals, atoms = target.atoms;
@@ -188,18 +209,20 @@ function applyPlan(input, plan, statePath) {
 
 function verify(state, plan) {
   const target = getTarget(state, plan.targetOwner);
-  const projects = pairs(plan.projects).filter(([id]) => !target.globals['local-projects']?.[id]);
+  const normalizeRoot = root => process.platform === 'win32' ? path.normalize(root).toLowerCase() : path.normalize(root);
+  const projects = pairs(plan.projects).filter(([id, expected]) => {
+    const actual = target.globals['local-projects']?.[id];
+    return !isPureLocal(id, actual) || actual.name !== expected.name ||
+      !isDeepStrictEqual(actual.rootPaths.map(normalizeRoot), expected.rootPaths.map(normalizeRoot));
+  });
   const assignments = pairs(plan.assignments).filter(([id, expected]) =>
-    target.globals['thread-project-assignments']?.[id]?.projectId !== expected.projectId);
+    target.globals['thread-project-assignments']?.[id]?.projectId !== expected.projectId ||
+    target.globals['thread-project-assignments']?.[id]?.projectKind !== 'local' ||
+    target.globals['thread-project-assignments']?.[id]?.projectOrigin === 'chatgpt');
   return { activeAccount: target.active, missingProjects: projects.length, missingAssignments: assignments.length,
+    recordsMatch: projects.length === 0 && assignments.length === 0,
+    verificationScope: 'persisted_local_state',
     success: target.active && projects.length === 0 && assignments.length === 0 };
-}
-
-function writeAtomic(file, text) {
-  const temp = `${file}.local-project-sync-${crypto.randomUUID()}.tmp`;
-  const fd = fs.openSync(temp, 'wx');
-  try { fs.writeFileSync(fd, text, 'utf8'); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  fs.renameSync(temp, file);
 }
 
 function main() {
@@ -223,31 +246,35 @@ function main() {
   } else {
     const plan = readJson(path.join(runDir, 'plan.json'));
     assert.equal(plan.statePath, statePath, 'State path differs from the prepared plan.');
-    if (command === 'verify') {
+    if (command === 'preflight') {
+      const current = readJson(statePath), check = verify(current, plan);
+      assert.equal(plan.fingerprint, planFingerprint(plan), 'The plan was modified. Run the tool again.');
+      if (!check.recordsMatch) assert.equal(buildPlan(current, { targetOwner: plan.targetOwner }).fingerprint,
+        plan.fingerprint, 'Local project metadata changed after planning. Nothing was written; run the tool again.');
+      console.log(JSON.stringify({ ready: !check.recordsMatch, alreadyPresent: check.recordsMatch }));
+    } else if (command === 'verify') {
       const result = verify(readJson(statePath), plan);
       console.log(JSON.stringify(result));
       process.exitCode = result.success ? 0 : 2;
     } else {
       assert.equal(command, 'apply');
       assert.equal(process.env.CODEX_LOCAL_SYNC_APP_CLOSED, '1', 'Use the shutdown-aware launcher.');
-      const beforeText = fs.readFileSync(statePath, 'utf8'), before = JSON.parse(beforeText);
+      const beforeBytes = fs.readFileSync(statePath), before = parseJson(beforeBytes);
       const state = applyPlan(before, plan, statePath);
-      if (!isDeepStrictEqual(before, state)) {
-        fs.writeFileSync(path.join(runDir, 'state.before.json'), beforeText, { flag: 'wx' });
-        assert.equal(digest(fs.readFileSync(statePath, 'utf8')), digest(beforeText), 'State changed concurrently; no import was performed.');
-        const text = JSON.stringify(state);
-        writeAtomic(statePath, text);
-        writeAtomic(`${statePath}.bak`, text);
-        assert.deepEqual(readJson(statePath), state);
+      const changed = !isDeepStrictEqual(before, state);
+      if (changed) {
+        commitState({ statePath, beforeBytes, afterState: state, runDir });
       }
-      const result = { status: 'applied', ...plan.summary, backup: path.join(runDir, 'state.before.json') };
+      const savedBackup = path.join(runDir, 'state.before.json');
+      const result = { status: changed ? 'applied' : 'already_present', ...plan.summary,
+        backup: fs.existsSync(savedBackup) ? savedBackup : null };
       writeAtomic(path.join(runDir, 'result.json'), JSON.stringify(result, null, 2));
       console.log(JSON.stringify(result));
     }
   }
 }
 
-module.exports = { buildPlan, applyPlan, verify, isPureLocal };
+module.exports = { buildPlan, applyPlan, verify, isPureLocal, planFingerprint };
 if (require.main === module) {
   try { main(); } catch (error) { console.error(error.message); process.exitCode = 1; }
 }
