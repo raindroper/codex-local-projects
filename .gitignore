@@ -1,0 +1,15 @@
+node_modules/
+dist/
+work/
+runs/
+backups/
+.codex/
+*.log
+*.tmp
+*.zip
+*.sqlite*
+auth.json
+state.before.json
+plan.json
+result.json
+.local-project-sync.lock
